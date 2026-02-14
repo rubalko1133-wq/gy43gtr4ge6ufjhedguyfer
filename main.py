@@ -2,10 +2,12 @@ import logging
 import sqlite3
 import random
 import string
+import warnings
 from datetime import datetime
 from functools import wraps
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,6 +16,13 @@ from telegram.ext import (
     ConversationHandler,
     filters,
     ContextTypes,
+)
+
+# Подавляем конкретное предупреждение PTBUserWarning
+warnings.filterwarnings(
+    action="ignore",
+    message=r".*CallbackQueryHandler",
+    category=PTBUserWarning
 )
 
 # Настройка логирования
@@ -26,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 TOKEN = "8426732266:AAGAokm2pmq-FC9m0Laj3rlgFN328IsaFCw"
 ADMIN_IDS = [8287134813, 1431520267]  # ID администраторов бота
-GROUP_CHAT_ID = -1003737353498  # ID вашей группы (со знаком минус) - нужно заменить!
+GROUP_CHAT_ID = -1003737353498  # ID вашей группы
 
 # Состояния для ConversationHandler
 REGISTER_NICKNAME = 1
@@ -786,9 +795,8 @@ def main():
     print("Бот запущен...")
     print(f"Токен: {TOKEN}")
     print(f"Администраторы: {ADMIN_IDS}")
-    print("⚠️ НЕ ЗАБУДЬТЕ ЗАМЕНИТЬ GROUP_CHAT_ID на ID вашей группы!")
+    print(f"ID группы: {GROUP_CHAT_ID}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
-
