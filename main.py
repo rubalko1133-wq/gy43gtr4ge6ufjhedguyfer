@@ -17,7 +17,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Подавляем конкретное предупреждение PTBUserWarning для CallbackQueryHandler в ConversationHandler
+# Подавляем предупреждение
 warnings.filterwarnings(
     action="ignore",
     message=r".*CallbackQueryHandler",
@@ -29,15 +29,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-
-# Также можно уменьшить количество логов от httpx, если они мешают
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 # Конфигурация
 TOKEN = "8426732266:AAGAokm2pmq-FC9m0Laj3rlgFN328IsaFCw"
-ADMIN_IDS = [8287134813]  # ID администраторов
+ADMIN_IDS = [8287134813, 1431520267]  # ID администраторов
 GROUP_CHAT_ID = -1003737353498  # ID группы
 
 # Состояния для ConversationHandler
@@ -104,6 +101,21 @@ def is_user_registered(user_id):
     conn.close()
     return result
 
+# Получение информации о пользователе для админов
+def get_user_info(user_id=None, nickname=None):
+    conn = sqlite3.connect('anon_bot.db')
+    c = conn.cursor()
+    if user_id:
+        c.execute("SELECT user_id, username, first_name, nickname, join_date, messages_count, is_banned, ban_reason FROM users WHERE user_id=?", (user_id,))
+    elif nickname:
+        c.execute("SELECT user_id, username, first_name, nickname, join_date, messages_count, is_banned, ban_reason FROM users WHERE nickname=?", (nickname,))
+    else:
+        conn.close()
+        return None
+    result = c.fetchone()
+    conn.close()
+    return result
+
 # Генерация случайного ника
 def generate_random_nickname():
     adjectives = ['Смелый', 'Храбрый', 'Веселый', 'Умный', 'Быстрый', 'Тихий', 'Яркий']
@@ -129,38 +141,69 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = is_user_registered(user.id)
     
     if result and result[0] == 1:
+        # Показываем информацию о привязке аккаунта
         await update.message.reply_text(
-            f"👋 С возвращением, *{result[2]}*!\n"
-            f"Просто напиши мне сообщение, и я отправлю его в группу анонимно.",
+            f"👋 С возвращением, *{result[2]}*!\n\n"
+            f"🔐 *Ваш аккаунт привязан:*\n"
+            f"• Telegram ID: `{user.id}`\n"
+            f"• Username: @{user.username if user.username else 'не указан'}\n"
+            f"• Имя: {user.first_name}\n"
+            f"• Ник в чате: *{result[2]}*\n\n"
+            f"📝 Просто напиши мне сообщение, и я отправлю его в группу анонимно.",
             parse_mode='Markdown'
         )
     else:
         await update.message.reply_text(
             "👋 Добро пожаловать в анонимный чат!\n\n"
-            "Для начала работы нужно зарегистрироваться.\n"
-            "Используй /register"
+            "🔐 *Для участия нужно привязать аккаунт:*\n"
+            "• Выберите никнейм\n"
+            "• Он будет привязан к вашему Telegram ID\n"
+            "• Никнейм будет виден в группе\n\n"
+            "Используй /register для регистрации.",
+            parse_mode='Markdown'
         )
 
 # Команда регистрации
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     
     # Проверяем, не зарегистрирован ли уже
     result = is_user_registered(user_id)
     
     if result and result[0] == 1:
-        await update.message.reply_text(f"✅ Вы уже зарегистрированы как *{result[2]}*!", parse_mode='Markdown')
+        await update.message.reply_text(
+            f"✅ Вы уже зарегистрированы!\n\n"
+            f"🔐 *Привязка аккаунта:*\n"
+            f"• Telegram ID: `{user_id}`\n"
+            f"• Ваш ник: *{result[2]}*\n"
+            f"• Статус: {'✅ Активен' if not result[1] else '🚫 Забанен'}\n\n"
+            f"Хотите сменить ник? Используйте /changenick",
+            parse_mode='Markdown'
+        )
         return ConversationHandler.END
+    
+    # Показываем информацию о привязке перед регистрацией
+    await update.message.reply_text(
+        f"🔐 *Привязка аккаунта*\n\n"
+        f"Ваш Telegram ID: `{user_id}`\n"
+        f"Username: @{user.username if user.username else 'не указан'}\n"
+        f"Имя: {user.first_name}\n\n"
+        f"Этот ID будет навсегда привязан к выбранному нику.\n"
+        f"С одного аккаунта нельзя зарегистрировать несколько ников.\n\n"
+        f"Продолжаем регистрацию?",
+        parse_mode='Markdown'
+    )
     
     keyboard = [
         [InlineKeyboardButton("🎲 Случайный ник", callback_data="random_nick")],
         [InlineKeyboardButton("✏️ Свой ник", callback_data="custom_nick")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_reg")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "📝 Регистрация\n\n"
-        "Выберите способ создания ника:",
+        "📝 Выберите способ создания ника:",
         reply_markup=reply_markup
     )
     return REGISTER_NICKNAME
@@ -170,6 +213,10 @@ async def register_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
+    if query.data == "cancel_reg":
+        await query.edit_message_text("❌ Регистрация отменена.")
+        return ConversationHandler.END
+    
     if query.data == "random_nick":
         # Генерируем уникальный ник
         while True:
@@ -178,7 +225,8 @@ async def register_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
         
         # Сохраняем ник
-        user_id = query.from_user.id
+        user = query.from_user
+        user_id = user.id
         conn = sqlite3.connect('anon_bot.db')
         c = conn.cursor()
         c.execute("""UPDATE users 
@@ -188,10 +236,16 @@ async def register_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         
+        # Показываем подтверждение с информацией о привязке
         await query.edit_message_text(
-            f"✅ Регистрация завершена!\n\n"
-            f"Ваш ник: *{nickname}*\n"
-            f"Теперь просто пишите мне сообщения, и я буду отправлять их в группу.",
+            f"✅ *Регистрация завершена!*\n\n"
+            f"🔐 *Аккаунт привязан:*\n"
+            f"• Telegram ID: `{user_id}`\n"
+            f"• Username: @{user.username if user.username else 'не указан'}\n"
+            f"• Имя: {user.first_name}\n"
+            f"• Ваш ник: *{nickname}*\n\n"
+            f"📝 Теперь просто пишите мне сообщения, и я буду отправлять их в группу.\n"
+            f"ℹ️ Для просмотра профиля используйте /myprofile",
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -202,13 +256,15 @@ async def register_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Требования:\n"
             "• Только буквы, цифры и _\n"
             "• Длина от 3 до 20 символов\n"
-            "• Ник должен быть уникальным"
+            "• Ник должен быть уникальным\n\n"
+            "Этот ник будет привязан к вашему Telegram ID."
         )
         return REGISTER_NICKNAME
 
 # Обработка ввода своего ника
 async def register_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     nickname = update.message.text.strip()
     
     # Валидация
@@ -238,10 +294,16 @@ async def register_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
+    # Показываем подтверждение с информацией о привязке
     await update.message.reply_text(
-        f"✅ Регистрация завершена!\n\n"
-        f"Ваш ник: *{nickname}*\n"
-        f"Теперь просто пишите мне сообщения, и я буду отправлять их в группу.",
+        f"✅ *Регистрация завершена!*\n\n"
+        f"🔐 *Аккаунт привязан:*\n"
+        f"• Telegram ID: `{user_id}`\n"
+        f"• Username: @{user.username if user.username else 'не указан'}\n"
+        f"• Имя: {user.first_name}\n"
+        f"• Ваш ник: *{nickname}*\n\n"
+        f"📝 Теперь просто пишите мне сообщения, и я буду отправлять их в группу.\n"
+        f"ℹ️ Для просмотра профиля используйте /myprofile",
         parse_mode='Markdown'
     )
     return ConversationHandler.END
@@ -258,26 +320,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 👤 *Для всех:*
 /start - Начать работу
-/register - Регистрация
-/myprofile - Мой профиль
+/register - Регистрация (привязка аккаунта)
+/myprofile - Мой профиль (информация о привязке)
 /changenick - Сменить ник
 /help - Это меню
 
 📝 *Как пользоваться:*
 1. Зарегистрируйтесь через /register
-2. Просто напишите мне любое сообщение
-3. Я анонимно отправлю его в группу
+2. Ваш Telegram ID привяжется к нику
+3. Пишите сообщения - они уйдут в группу анонимно
 
 👑 *Для админов:*
 /admin - Панель управления
 /ban [ник] [причина] - Забанить
 /unban [ник] - Разбанить
+/user [ник или ID] - Информация о пользователе
     """
     await update.message.reply_text(text, parse_mode='Markdown')
 
 # Профиль
 async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     
     result = is_user_registered(user_id)
     
@@ -295,20 +359,71 @@ async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     
     status = "✅ Активен" if not is_banned else f"🚫 Забанен"
+    ban_status = f"\n🚫 Причина бана: {c.fetchone()[0]}" if is_banned else ""
     
     profile_text = f"""
 👤 *Ваш профиль:*
 
-📝 *Никнейм:* {nickname}
-📅 *Регистрация:* {join_date[:10]}
-💬 *Сообщений отправлено:* {msg_count}
-🚫 *Статус:* {status}
+🔐 *Привязка аккаунта:*
+• Telegram ID: `{user_id}`
+• Username: @{user.username if user.username else 'не указан'}
+• Имя: {user.first_name}
+
+📝 *Данные в чате:*
+• Никнейм: *{nickname}*
+• Дата регистрации: {join_date[:10]}
+• Сообщений отправлено: {msg_count}
+• Статус: {status}{ban_status}
     """
     await update.message.reply_text(profile_text, parse_mode='Markdown')
 
+# Информация о пользователе для админов
+async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    try:
+        query = ' '.join(context.args)
+        
+        # Пытаемся найти по ID или нику
+        user_info = None
+        if query.isdigit():
+            user_info = get_user_info(user_id=int(query))
+        else:
+            user_info = get_user_info(nickname=query)
+        
+        if not user_info:
+            await update.message.reply_text(f"❌ Пользователь не найден: {query}")
+            return
+        
+        user_id, username, first_name, nickname, join_date, msg_count, is_banned, ban_reason = user_info
+        
+        status = "🚫 Забанен" if is_banned else "✅ Активен"
+        ban_info = f"\n• Причина бана: {ban_reason}" if is_banned and ban_reason else ""
+        
+        text = f"""
+👤 *Информация о пользователе:*
+
+🔐 *Аккаунт Telegram:*
+• ID: `{user_id}`
+• Username: @{username if username else 'не указан'}
+• Имя: {first_name}
+
+📝 *Данные в чате:*
+• Никнейм: *{nickname}*
+• Дата регистрации: {join_date[:10]}
+• Сообщений: {msg_count}
+• Статус: {status}{ban_info}
+        """
+        await update.message.reply_text(text, parse_mode='Markdown')
+        
+    except IndexError:
+        await update.message.reply_text("❌ Использование: /user [ник или ID]")
+
 # Смена ника
 async def change_nick_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     
     result = is_user_registered(user_id)
     
@@ -317,17 +432,18 @@ async def change_nick_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     
     await update.message.reply_text(
-        "✏️ Введите новый никнейм:\n\n"
-        "Требования:\n"
-        "• Только буквы, цифры и _\n"
-        "• Длина от 3 до 20 символов\n"
-        "• Ник должен быть уникальным"
+        f"✏️ *Смена ника*\n\n"
+        f"Текущий ник: *{result[2]}*\n"
+        f"Telegram ID: `{user_id}` (останется привязанным)\n\n"
+        f"Введите новый никнейм:",
+        parse_mode='Markdown'
     )
     return REGISTER_NICKNAME
 
 # Обработка смены ника
 async def change_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     new_nickname = update.message.text.strip()
     
     # Валидация
@@ -351,7 +467,12 @@ async def change_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
-    await update.message.reply_text(f"✅ Никнейм успешно изменен на *{new_nickname}*", parse_mode='Markdown')
+    await update.message.reply_text(
+        f"✅ *Никнейм изменен!*\n\n"
+        f"🔐 Привязка к Telegram ID `{user_id}` сохранена.\n"
+        f"📝 Новый ник: *{new_nickname}*",
+        parse_mode='Markdown'
+    )
     return ConversationHandler.END
 
 # Обработка сообщений от пользователя (пересылка в группу)
@@ -378,7 +499,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         await update.message.reply_text(
             "❌ Вы не зарегистрированы.\n"
-            "Используйте /register для регистрации."
+            "Используйте /register для регистрации и привязки аккаунта."
         )
         return
     
@@ -387,7 +508,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if is_registered == 0:
         await update.message.reply_text(
             "❌ Вы не зарегистрированы.\n"
-            "Используйте /register для регистрации."
+            "Используйте /register для регистрации и привязки аккаунта."
         )
         return
     
@@ -566,13 +687,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, parse_mode='Markdown')
     
     elif query.data == "admin_users":
-        c.execute("SELECT nickname, messages_count, is_banned FROM users WHERE is_registered=1 ORDER BY messages_count DESC LIMIT 20")
+        c.execute("SELECT nickname, user_id, messages_count, is_banned FROM users WHERE is_registered=1 ORDER BY messages_count DESC LIMIT 20")
         users = c.fetchall()
         
         text = "👥 *Активные пользователи:*\n\n"
-        for nick, msgs, banned in users:
+        for nick, uid, msgs, banned in users:
             status = "🚫" if banned else "✅"
-            text += f"{status} *{nick}* — {msgs} сообщ.\n"
+            text += f"{status} *{nick}* (ID: `{uid}`) — {msgs} сообщ.\n"
         
         await query.edit_message_text(text, parse_mode='Markdown')
     
@@ -632,7 +753,7 @@ def main():
         entry_points=[CommandHandler("register", register_start)],
         states={
             REGISTER_NICKNAME: [
-                CallbackQueryHandler(register_choice, pattern="^(random_nick|custom_nick)$"),
+                CallbackQueryHandler(register_choice, pattern="^(random_nick|custom_nick|cancel_reg)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, register_nickname)
             ]
         },
@@ -655,6 +776,7 @@ def main():
     application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(CommandHandler("ban", ban_user))
     application.add_handler(CommandHandler("unban", unban_user))
+    application.add_handler(CommandHandler("user", user_info))
     
     application.add_handler(register_conv)
     application.add_handler(changenick_conv)
@@ -671,10 +793,9 @@ def main():
     print("✅ Бот-пересыльщик запущен!")
     print(f"📨 Сообщения из ЛС будут отправляться в группу с ID: {GROUP_CHAT_ID}")
     print(f"👑 Администраторы: {ADMIN_IDS}")
-    print("⚙️ Предупреждения PTBUserWarning подавлены.")
+    print("🔐 Привязка аккаунта: включена (Telegram ID <-> Ник)")
     
     application.run_polling()
 
 if __name__ == '__main__':
     main()
-
