@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 TOKEN = "8426732266:AAGAokm2pmq-FC9m0Laj3rlgFN328IsaFCw"
 ADMIN_IDS = [8287134813, 1431520267]  # ID администраторов бота
-GROUP_CHAT_ID = -1001234567890  # ID вашей группы (со знаком минус) - нужно заменить!
+GROUP_CHAT_ID = -1003737353498  # ID вашей группы (со знаком минус) - нужно заменить!
 
 # Состояния для ConversationHandler
 REGISTER_NICKNAME = 1
@@ -791,3 +791,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
