@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TOKEN = "8426732266:AAGAokm2pmq-FC9m0Laj3rlgFN328IsaFCw"
-ADMIN_IDS = [8287134813, 1431520267]  # ID администраторов
+ADMIN_IDS = [8287134813]  # ID администраторов
 GROUP_CHAT_ID = -1003737353498  # ID группы
 
 # Состояния для ConversationHandler
@@ -677,3 +677,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
