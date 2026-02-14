@@ -1,28 +1,59 @@
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime
-from typing import Union
+import pandas as pd
+from datetime import datetime, timedelta
+from typing import Union, Dict, Optional
+from enum import Enum
+import os
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.filters import Command, CommandObject
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "8576803474:AAHM6zzi4s-Ey097oejl8lr9FwjUg3_F_Rg"  # Токен бота от @BotFather
-CHANNEL_ID = -1003842969203  # ID канала (отрицательное число с -100)
-ADMIN_IDS = [8287134813,1431520267]  # ID админов (через запятую)
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Токен бота от @BotFather
+CHANNEL_ID = -1001234567890  # ID канала (отрицательное число с -100)
+ADMIN_IDS = [123456789, 987654321]  # ID админов (через запятую)
 # ================================================
+
+# Проверка токена
+if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    print("=" * 50)
+    print("ОШИБКА: Вы не указали токен бота!")
+    print("=" * 50)
+    exit(1)
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Инициализация бота и диспетчера
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+storage = MemoryStorage()
+try:
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=storage)
+    logger.info("✅ Бот инициализирован")
+except Exception as e:
+    logger.error(f"❌ Ошибка инициализации бота: {e}")
+    exit(1)
+
+# ================== СОСТОЯНИЯ ==================
+class AdminStates(StatesGroup):
+    waiting_for_ban_reason = State()
+    waiting_for_export_date = State()
+
+class PostStatus(Enum):
+    NEW = "new"
+    TAKEN = "taken"
+    PUBLISHED = "published"
+    REJECTED = "rejected"
 
 # ================== РАБОТА С БАЗОЙ ДАННЫХ ==================
 def init_db():
@@ -30,169 +61,489 @@ def init_db():
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
+    # Таблица для хранения ВСЕХ данных отправителей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            message_text TEXT,
+            message_type TEXT,
+            file_id TEXT,
+            caption TEXT,
+            received_date TEXT,
+            forward_message_id INTEGER UNIQUE,
+            status TEXT DEFAULT 'new',
+            taken_by INTEGER DEFAULT NULL,
+            taken_date TEXT DEFAULT NULL,
+            published_date TEXT DEFAULT NULL,
+            channel_message_id INTEGER DEFAULT 0
+        )
+    ''')
+    
     # Таблица забаненных пользователей
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS banned_users (
             user_id INTEGER PRIMARY KEY,
             ban_date TEXT,
-            reason TEXT
+            reason TEXT,
+            banned_by INTEGER
         )
     ''')
     
-    # Таблица для хранения связи сообщений
+    # Таблица для логов действий админов
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS message_links (
-            original_msg_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            forward_message_id INTEGER,
-            channel_message_id INTEGER,
-            msg_date TEXT,
-            UNIQUE(forward_message_id, channel_message_id)
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER,
+            action TEXT,
+            target_user_id INTEGER,
+            details TEXT,
+            action_date TEXT
+        )
+    ''')
+    
+    # Таблица настроек админов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS admin_settings (
+            admin_id INTEGER PRIMARY KEY,
+            receive_all_posts INTEGER DEFAULT 1,
+            notify_on_taken INTEGER DEFAULT 1
         )
     ''')
     
     conn.commit()
     conn.close()
+    logger.info("✅ База данных инициализирована")
+
+def save_user_message(user_id: int, username: str, first_name: str, last_name: str, 
+                      message_text: str, message_type: str, file_id: str, caption: str, 
+                      forward_msg_id: int):
+    """Сохранение данных отправителя в базу"""
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO user_messages 
+            (user_id, username, first_name, last_name, message_text, message_type, 
+             file_id, caption, received_date, forward_message_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id, username, first_name, last_name, message_text, message_type,
+            file_id, caption, datetime.now().isoformat(), forward_msg_id, PostStatus.NEW.value
+        ))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Сообщение от {user_id} сохранено в БД")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения сообщения: {e}")
+        return False
+
+def update_message_status(forward_msg_id: int, status: PostStatus, taken_by: int = None, channel_msg_id: int = None):
+    """Обновление статуса сообщения"""
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        
+        if status == PostStatus.TAKEN and taken_by:
+            cursor.execute('''
+                UPDATE user_messages 
+                SET status = ?, taken_by = ?, taken_date = ? 
+                WHERE forward_message_id = ?
+            ''', (status.value, taken_by, datetime.now().isoformat(), forward_msg_id))
+        
+        elif status == PostStatus.PUBLISHED and channel_msg_id:
+            cursor.execute('''
+                UPDATE user_messages 
+                SET status = ?, published_date = ?, channel_message_id = ? 
+                WHERE forward_message_id = ?
+            ''', (status.value, datetime.now().isoformat(), channel_msg_id, forward_msg_id))
+        
+        elif status == PostStatus.REJECTED:
+            cursor.execute('''
+                UPDATE user_messages 
+                SET status = ? 
+                WHERE forward_message_id = ?
+            ''', (status.value, forward_msg_id))
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка обновления статуса: {e}")
+        return False
+
+def get_message_info(forward_msg_id: int) -> dict:
+    """Получение информации о сообщении"""
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT user_id, username, first_name, last_name, message_text, 
+                   message_type, received_date, status, taken_by, channel_message_id
+            FROM user_messages WHERE forward_message_id = ?
+        ''', (forward_msg_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return {
+                'user_id': result[0],
+                'username': result[1],
+                'first_name': result[2],
+                'last_name': result[3],
+                'message_text': result[4],
+                'message_type': result[5],
+                'received_date': result[6],
+                'status': result[7],
+                'taken_by': result[8],
+                'channel_msg_id': result[9]
+            }
+    except Exception as e:
+        logger.error(f"Ошибка получения информации: {e}")
+    return None
+
+def export_to_excel(admin_id: int, days: int = None) -> BytesIO:
+    """Экспорт данных в Excel"""
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        
+        # Формируем запрос
+        query = '''
+            SELECT 
+                user_id as "ID пользователя",
+                username as "Username",
+                first_name as "Имя",
+                last_name as "Фамилия",
+                message_text as "Текст сообщения",
+                message_type as "Тип",
+                received_date as "Дата получения",
+                status as "Статус",
+                taken_by as "Взял админ",
+                taken_date as "Дата взятия",
+                published_date as "Дата публикации",
+                channel_message_id as "ID в канале"
+            FROM user_messages
+        '''
+        
+        if days:
+            cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+            query += f" WHERE received_date >= '{cutoff_date}'"
+        
+        query += " ORDER BY received_date DESC"
+        
+        # Читаем в pandas
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        # Создаем Excel файл в памяти
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Сообщения', index=False)
+            
+            # Настраиваем ширину колонок
+            worksheet = writer.sheets['Сообщения']
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+        
+        output.seek(0)
+        logger.info(f"✅ Экспорт данных выполнен админом {admin_id}")
+        return output
+    except Exception as e:
+        logger.error(f"❌ Ошибка экспорта в Excel: {e}")
+        return None
+
+def get_user_stats(user_id: int = None) -> dict:
+    """Получение статистики"""
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        
+        if user_id:
+            cursor.execute('''
+                SELECT COUNT(*), 
+                       SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END),
+                       MAX(received_date)
+                FROM user_messages WHERE user_id = ?
+            ''', (user_id,))
+            total, published, last = cursor.fetchone()
+            result = {
+                'total': total or 0,
+                'published': published or 0,
+                'last_message': last
+            }
+        else:
+            cursor.execute('SELECT COUNT(*) FROM user_messages')
+            total = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM user_messages WHERE status = 'published'")
+            published = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM user_messages WHERE status = 'new'")
+            new = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM user_messages WHERE status = 'taken'")
+            taken = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM banned_users")
+            banned = cursor.fetchone()[0]
+            
+            result = {
+                'total': total,
+                'published': published,
+                'new': new,
+                'taken': taken,
+                'banned': banned
+            }
+        
+        conn.close()
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики: {e}")
+        return {}
 
 def is_user_banned(user_id: int) -> bool:
-    """Проверка, забанен ли пользователь"""
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT 1 FROM banned_users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone() is not None
-    conn.close()
-    return result
+    """Проверка бана"""
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT reason FROM banned_users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result is not None
+    except:
+        return False
 
-def ban_user(user_id: int, reason: str = "Нарушение правил"):
-    """Добавление пользователя в бан"""
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute(
-        'INSERT OR REPLACE INTO banned_users (user_id, ban_date, reason) VALUES (?, ?, ?)',
-        (user_id, datetime.now().isoformat(), reason)
-    )
-    conn.commit()
-    conn.close()
+def ban_user(user_id: int, admin_id: int, reason: str):
+    """Бан пользователя"""
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO banned_users (user_id, ban_date, reason, banned_by) 
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, datetime.now().isoformat(), reason, admin_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Пользователь {user_id} забанен админом {admin_id}")
+    except Exception as e:
+        logger.error(f"Ошибка бана: {e}")
 
 def unban_user(user_id: int):
     """Разбан пользователя"""
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Пользователь {user_id} разбанен")
+    except Exception as e:
+        logger.error(f"Ошибка разбана: {e}")
 
-def save_message_link(user_id: int, forward_msg_id: int, channel_msg_id: int):
-    """Сохранение связи между сообщениями"""
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute(
-        'INSERT INTO message_links (user_id, forward_message_id, channel_message_id, msg_date) VALUES (?, ?, ?, ?)',
-        (user_id, forward_msg_id, channel_msg_id, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-def get_user_by_message(message_id: int, is_forward: bool = True) -> Union[int, None]:
-    """Получение user_id по ID сообщения"""
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    
-    if is_forward:
-        cursor.execute('SELECT user_id FROM message_links WHERE forward_message_id = ?', (message_id,))
-    else:
-        cursor.execute('SELECT user_id FROM message_links WHERE channel_message_id = ?', (message_id,))
-    
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
+def log_admin_action(admin_id: int, action: str, target_user_id: int = None, details: str = ""):
+    """Логирование действий админа"""
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO admin_logs (admin_id, action, target_user_id, details, action_date) 
+            VALUES (?, ?, ?, ?, ?)
+        ''', (admin_id, action, target_user_id, details, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка логирования: {e}")
 
 # ================== КЛАВИАТУРЫ ==================
-def get_moderation_keyboard(user_id: int, forward_id: int) -> InlineKeyboardMarkup:
+def get_moderation_keyboard(forward_id: int, taken_by: int = None) -> InlineKeyboardMarkup:
     """Клавиатура для модерации"""
     builder = InlineKeyboardBuilder()
+    
+    if taken_by:
+        builder.row(InlineKeyboardButton(
+            text=f"👤 В работе у {taken_by}",
+            callback_data="noop"
+        ))
+    
     builder.row(
         InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"pub_{forward_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rej_{forward_id}")
     )
+    
+    if not taken_by:
+        builder.row(
+            InlineKeyboardButton(text="📌 Взять в работу", callback_data=f"take_{forward_id}")
+        )
+    
     builder.row(
-        InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{forward_id}")
+        InlineKeyboardButton(text="🚫 Забанить автора", callback_data=f"ban_{forward_id}")
     )
+    
     return builder.as_markup()
 
-def get_reply_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура для ответа анонимному пользователю"""
-    builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(
-        text="✍️ Ответить анонимно", 
-        callback_data=f"reply_{user_id}"
-    ))
-    return builder.as_markup()
+# ================== КОМАНДЫ АДМИНОВ ==================
+# ВАЖНО: Все команды обрабатываются ДО основного обработчика сообщений
+# и НЕ попадают в предложку
 
-# ================== ОБРАБОТЧИКИ КОМАНД ==================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    """Обработка команды /start"""
+    """Старт для всех пользователей"""
     user_id = message.from_user.id
     
-    # Проверка на бан
     if is_user_banned(user_id):
-        await message.answer("⛔ Вы заблокированы и не можете отправлять сообщения.")
+        await message.answer("⛔ Вы заблокированы.")
+        return
+    
+    # Если это админ - показываем админ-меню
+    if user_id in ADMIN_IDS:
+        await show_admin_menu(message)
         return
     
     welcome_text = """
 👋 Привет! Я бот для анонимных сообщений в канал.
 
-📝 Просто отправь мне текст, фото или видео, и оно уйдет на модерацию.
-🔒 Твоя анонимность гарантирована - админ не увидит твои данные.
-⚠️ Помни: ты несешь ответственность за отправленный контент.
+📝 Просто отправь мне текст, фото или видео
+🔒 Твои данные видны только администрации
+⚠️ Не отправляй оскорбления и спам
     """
     await message.answer(welcome_text)
 
-@dp.message(Command("admin"))
-async def cmd_admin(message: types.Message):
-    """Панель администратора"""
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав администратора.")
-        return
-    
-    admin_text = """
-🔐 **Панель администратора**
+async def show_admin_menu(message: types.Message):
+    """Показ меню администратора"""
+    text = """
+🔐 **ПАНЕЛЬ АДМИНИСТРАТОРА**
 
-Команды:
+📊 **Команды:**
+/export - выгрузить все сообщения в Excel
+/export_days [N] - выгрузить сообщения за N дней
+/stats - общая статистика
+/user_stats [user_id] - статистика пользователя
 /ban [user_id] [причина] - забанить пользователя
 /unban [user_id] - разбанить пользователя
-/stats - статистика бота
+/help_admin - помощь по командам
+
+📝 **Важно:** Команды видны только вам
     """
-    await message.answer(admin_text, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command("export"))
+async def cmd_export(message: types.Message):
+    """Экспорт всех сообщений в Excel"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    await message.answer("📊 Генерирую Excel-файл со всеми сообщениями...")
+    
+    excel_file = export_to_excel(message.from_user.id)
+    
+    if excel_file:
+        await message.answer_document(
+            BufferedInputFile(
+                excel_file.getvalue(),
+                filename=f"messages_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            ),
+            caption="✅ Все сообщения"
+        )
+        log_admin_action(message.from_user.id, 'export_all')
+    else:
+        await message.answer("❌ Ошибка при создании файла")
+
+@dp.message(Command("export_days"))
+async def cmd_export_days(message: types.Message):
+    """Экспорт сообщений за N дней"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: /export_days [количество дней]")
+        return
+    
+    try:
+        days = int(args[1])
+        await message.answer(f"📊 Генерирую Excel-файл за последние {days} дней...")
+        
+        excel_file = export_to_excel(message.from_user.id, days)
+        
+        if excel_file:
+            await message.answer_document(
+                BufferedInputFile(
+                    excel_file.getvalue(),
+                    filename=f"messages_last_{days}_days_{datetime.now().strftime('%Y%m%d')}.xlsx"
+                ),
+                caption=f"✅ Сообщения за {days} дней"
+            )
+            log_admin_action(message.from_user.id, 'export_days', details=f"{days} days")
+        else:
+            await message.answer("❌ Ошибка при создании файла")
+    except ValueError:
+        await message.answer("❌ Некорректное число дней")
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
-    """Статистика бота"""
+    """Общая статистика"""
     if message.from_user.id not in ADMIN_IDS:
         return
     
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
+    stats = get_user_stats()
     
-    cursor.execute('SELECT COUNT(*) FROM banned_users')
-    banned_count = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM message_links')
-    messages_count = cursor.fetchone()[0]
-    
-    conn.close()
-    
-    stats_text = f"""
-📊 **Статистика бота**
-📝 Всего опубликовано: {messages_count}
-🚫 Забанено пользователей: {banned_count}
+    text = f"""
+📊 **ОБЩАЯ СТАТИСТИКА**
+
+📝 Всего сообщений: {stats.get('total', 0)}
+✅ Опубликовано: {stats.get('published', 0)}
+🆕 Новых: {stats.get('new', 0)}
+📌 В работе: {stats.get('taken', 0)}
+🚫 Забанено: {stats.get('banned', 0)}
     """
-    await message.answer(stats_text, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command("user_stats"))
+async def cmd_user_stats(message: types.Message):
+    """Статистика пользователя"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: /user_stats [user_id]")
+        return
+    
+    try:
+        user_id = int(args[1])
+        stats = get_user_stats(user_id)
+        
+        last_date = ""
+        if stats.get('last_message'):
+            last_date = datetime.fromisoformat(stats['last_message']).strftime('%d.%m.%Y %H:%M')
+        
+        text = f"""
+👤 **СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ {user_id}**
+
+📝 Всего сообщений: {stats.get('total', 0)}
+✅ Опубликовано: {stats.get('published', 0)}
+📅 Последнее сообщение: {last_date or 'нет'}
+        """
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    except ValueError:
+        await message.answer("❌ Некорректный ID")
 
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message):
-    """Бан пользователя по ID"""
+    """Бан пользователя"""
     if message.from_user.id not in ADMIN_IDS:
         return
     
@@ -205,10 +556,17 @@ async def cmd_ban(message: types.Message):
         user_id = int(args[1])
         reason = args[2] if len(args) > 2 else "Нарушение правил"
         
-        ban_user(user_id, reason)
+        ban_user(user_id, message.from_user.id, reason)
+        log_admin_action(message.from_user.id, 'ban', user_id, reason)
+        
+        try:
+            await bot.send_message(user_id, f"⛔ Вы забанены.\nПричина: {reason}")
+        except:
+            pass
+        
         await message.answer(f"✅ Пользователь {user_id} забанен. Причина: {reason}")
     except ValueError:
-        await message.answer("❌ Некорректный ID пользователя")
+        await message.answer("❌ Некорректный ID")
 
 @dp.message(Command("unban"))
 async def cmd_unban(message: types.Message):
@@ -224,237 +582,361 @@ async def cmd_unban(message: types.Message):
     try:
         user_id = int(args[1])
         unban_user(user_id)
+        log_admin_action(message.from_user.id, 'unban', user_id)
+        
         await message.answer(f"✅ Пользователь {user_id} разбанен")
     except ValueError:
-        await message.answer("❌ Некорректный ID пользователя")
+        await message.answer("❌ Некорректный ID")
 
-# ================== ОБРАБОТЧИК СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ==================
-@dp.message(F.text | F.photo | F.video | F.voice | F.document)
-async def handle_user_message(message: types.Message):
-    """Обработка входящих сообщений от пользователей"""
-    user_id = message.from_user.id
-    
-    # Проверка на бан
-    if is_user_banned(user_id):
-        await message.answer("⛔ Вы заблокированы. Вы не можете отправлять сообщения.")
+@dp.message(Command("help_admin"))
+async def cmd_help_admin(message: types.Message):
+    """Помощь по админским командам"""
+    if message.from_user.id not in ADMIN_IDS:
         return
     
-    # Сообщение для админов (копия с кнопками)
-    admin_text = f"📨 **Новое сообщение от пользователя**\n"
-    admin_text += f"🆔 User ID: `{user_id}`\n"
-    admin_text += f"👤 Username: @{message.from_user.username or 'отсутствует'}\n"
-    admin_text += f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+    text = """
+📚 **ПОМОЩЬ ПО КОМАНДАМ**
+
+**Экспорт данных:**
+/export - все сообщения в Excel
+/export_days 7 - за последние 7 дней
+
+**Статистика:**
+/stats - общая статистика
+/user_stats 123456 - статистика пользователя
+
+**Управление:**
+/ban 123456 причина - заблокировать
+/unban 123456 - разблокировать
+
+**Модерация (кнопки в чате):**
+✅ Опубликовать - пост уходит в канал
+❌ Отклонить - пост не публикуется
+📌 Взять в работу - закрепить пост за собой
+🚫 Забанить автора - бан отправителя
+
+📌 **Важно:** Все команды работают только в личке с ботом
+    """
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+# ================== ФИЛЬТР ДЛЯ КОМАНД ==================
+def is_command(message: types.Message) -> bool:
+    """Проверяет, является ли сообщение командой"""
+    return message.text and message.text.startswith('/')
+
+# ================== ОБРАБОТЧИК СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ==================
+@dp.message(lambda message: not is_command(message))  # ВАЖНО: Игнорируем команды!
+async def handle_user_message(message: types.Message):
+    """Обработка входящих сообщений (НЕ КОМАНД)"""
+    user_id = message.from_user.id
     
-    # Пересылаем копию админам
-    for admin_id in ADMIN_IDS:
-        try:
-            # Отправляем копию сообщения
-            if message.text:
-                msg = await bot.send_message(
-                    admin_id, 
-                    admin_text + f"📝 Текст:\n{message.text}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_moderation_keyboard(user_id, message.message_id)
-                )
-            elif message.photo:
-                # Для фото отправляем подпись отдельно
-                caption = message.caption or ""
-                sent_msg = await bot.send_photo(
-                    admin_id,
-                    message.photo[-1].file_id,
-                    caption=admin_text + f"📝 Подпись: {caption}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_moderation_keyboard(user_id, message.message_id)
-                )
-                msg = sent_msg
-            elif message.video:
-                sent_msg = await bot.send_video(
-                    admin_id,
-                    message.video.file_id,
-                    caption=admin_text + f"📝 Подпись: {message.caption or ''}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_moderation_keyboard(user_id, message.message_id)
-                )
-                msg = sent_msg
-            elif message.voice:
-                sent_msg = await bot.send_voice(
-                    admin_id,
-                    message.voice.file_id,
-                    caption=admin_text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_moderation_keyboard(user_id, message.message_id)
-                )
-                msg = sent_msg
-            else:
-                # Другие типы файлов
-                sent_msg = await bot.send_document(
-                    admin_id,
-                    message.document.file_id,
-                    caption=admin_text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_moderation_keyboard(user_id, message.message_id)
-                )
-                msg = sent_msg
-            
-            # Сохраняем связь forward_id -> user_id
-            save_message_link(user_id, msg.message_id, 0)  # channel_message_id пока 0
-            
-        except Exception as e:
-            logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+    # Дополнительная проверка на команды (на всякий случай)
+    if message.text and message.text.startswith('/'):
+        logger.info(f"Игнорируем команду от {user_id}: {message.text}")
+        return
     
-    # Подтверждение пользователю
-    await message.answer("✅ Ваше сообщение отправлено на модерацию. После проверки оно появится в канале.")
+    # Проверка бана
+    if is_user_banned(user_id):
+        await message.answer("⛔ Вы заблокированы.")
+        return
+    
+    # Собираем данные отправителя
+    username = message.from_user.username or ""
+    first_name = message.from_user.first_name or ""
+    last_name = message.from_user.last_name or ""
+    message_text = message.text or message.caption or ""
+    message_type = "text"
+    file_id = ""
+    caption = message.caption or ""
+    
+    if message.photo:
+        message_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        message_type = "video"
+        file_id = message.video.file_id
+    elif message.voice:
+        message_type = "voice"
+        file_id = message.voice.file_id
+    elif message.document:
+        message_type = "document"
+        file_id = message.document.file_id
+    elif message.audio:
+        message_type = "audio"
+        file_id = message.audio.file_id
+    elif message.sticker:
+        message_type = "sticker"
+        file_id = message.sticker.file_id
+    elif message.animation:
+        message_type = "gif"
+        file_id = message.animation.file_id
+    
+    # Сохраняем ВСЕ данные в БД
+    if save_user_message(
+        user_id, username, first_name, last_name,
+        message_text, message_type, file_id, caption,
+        message.message_id
+    ):
+        # Отправляем админам (без данных отправителя в тексте!)
+        admin_text = f"📨 **Новое сообщение**\n"
+        admin_text += f"🆔 ID: `{user_id}`\n"
+        admin_text += f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+        
+        sent_to_admins = 0
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                if message.text:
+                    sent_msg = await bot.send_message(
+                        admin_id,
+                        admin_text + f"📝 Текст:\n{message.text}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=get_moderation_keyboard(message.message_id)
+                    )
+                elif message.photo:
+                    sent_msg = await bot.send_photo(
+                        admin_id,
+                        message.photo[-1].file_id,
+                        caption=admin_text + f"📝 Подпись: {caption}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=get_moderation_keyboard(message.message_id)
+                    )
+                elif message.video:
+                    sent_msg = await bot.send_video(
+                        admin_id,
+                        message.video.file_id,
+                        caption=admin_text + f"📝 Подпись: {caption}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=get_moderation_keyboard(message.message_id)
+                    )
+                elif message.voice:
+                    sent_msg = await bot.send_voice(
+                        admin_id,
+                        message.voice.file_id,
+                        caption=admin_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=get_moderation_keyboard(message.message_id)
+                    )
+                elif message.document:
+                    sent_msg = await bot.send_document(
+                        admin_id,
+                        message.document.file_id,
+                        caption=admin_text + f"📝 Файл: {message.document.file_name}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=get_moderation_keyboard(message.message_id)
+                    )
+                elif message.sticker:
+                    sent_msg = await bot.send_sticker(
+                        admin_id,
+                        message.sticker.file_id,
+                        reply_markup=get_moderation_keyboard(message.message_id)
+                    )
+                elif message.animation:
+                    sent_msg = await bot.send_animation(
+                        admin_id,
+                        message.animation.file_id,
+                        caption=admin_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=get_moderation_keyboard(message.message_id)
+                    )
+                else:
+                    # Если тип не поддерживается
+                    await bot.send_message(
+                        admin_id,
+                        admin_text + f"📝 [Неподдерживаемый тип сообщения]",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=get_moderation_keyboard(message.message_id)
+                    )
+                
+                sent_to_admins += 1
+                
+            except Exception as e:
+                logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+        
+        if sent_to_admins > 0:
+            await message.answer("✅ Сообщение отправлено на модерацию!")
+        else:
+            await message.answer("⚠️ Временные проблемы, попробуйте позже")
+    else:
+        await message.answer("❌ Ошибка при сохранении сообщения")
 
 # ================== ОБРАБОТЧИК КНОПОК ==================
-@dp.callback_query(lambda c: c.data.startswith(('pub_', 'rej_', 'ban_', 'reply_')))
-async def process_callback(callback: CallbackQuery):
+@dp.callback_query(lambda c: c.data.startswith(('pub_', 'rej_', 'ban_', 'take_', 'noop')))
+async def process_callback(callback: types.CallbackQuery, state: FSMContext):
     """Обработка нажатий на кнопки"""
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("⛔ У вас нет прав администратора!", show_alert=True)
+    admin_id = callback.from_user.id
+    
+    if admin_id not in ADMIN_IDS:
+        await callback.answer("⛔ Нет прав!", show_alert=True)
         return
     
     action, data = callback.data.split('_', 1)
     
-    if action == 'pub':
-        # Публикация в канал
-        forward_id = int(data)
-        
-        # Получаем user_id по forward_id
-        user_id = get_user_by_message(forward_id)
-        if not user_id:
-            await callback.answer("❌ Ошибка: пользователь не найден", show_alert=True)
+    if action == 'noop':
+        await callback.answer()
+        return
+    
+    forward_id = int(data)
+    msg_info = get_message_info(forward_id)
+    
+    if not msg_info:
+        await callback.answer("❌ Сообщение не найдено", show_alert=True)
+        return
+    
+    if action == 'take':
+        # Взять в работу
+        if msg_info['status'] == PostStatus.TAKEN.value:
+            await callback.answer(f"❌ Уже в работе у {msg_info['taken_by']}", show_alert=True)
             return
         
-        # Получаем оригинальное сообщение
+        if update_message_status(forward_id, PostStatus.TAKEN, taken_by=admin_id):
+            log_admin_action(admin_id, 'take', msg_info['user_id'])
+            
+            # Обновляем клавиатуру
+            await callback.message.edit_reply_markup(
+                reply_markup=get_moderation_keyboard(forward_id, admin_id)
+            )
+            await callback.answer("✅ Пост в работе!")
+        else:
+            await callback.answer("❌ Ошибка", show_alert=True)
+    
+    elif action == 'pub':
+        # Публикация в канал
         try:
-            # Пересылаем сообщение в канал
+            # Пересылаем в канал
             forwarded = await bot.forward_message(
                 chat_id=CHANNEL_ID,
-                from_chat_id=callback.message.chat.id,
+                from_chat_id=admin_id,
                 message_id=callback.message.message_id
             )
             
-            # Обновляем связь с ID сообщения в канале
-            conn = sqlite3.connect('bot_database.db')
-            cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE message_links SET channel_message_id = ? WHERE forward_message_id = ?',
-                (forwarded.message_id, forward_id)
-            )
-            conn.commit()
-            conn.close()
-            
-            # Отправляем уведомление пользователю
-            try:
-                await bot.send_message(
-                    user_id,
-                    "✅ Ваше сообщение было опубликовано в канале!"
+            if update_message_status(forward_id, PostStatus.PUBLISHED, channel_msg_id=forwarded.message_id):
+                log_admin_action(admin_id, 'publish', msg_info['user_id'])
+                
+                # Уведомляем пользователя
+                try:
+                    await bot.send_message(
+                        msg_info['user_id'],
+                        "✅ Ваше сообщение опубликовано!"
+                    )
+                except:
+                    pass
+                
+                # Обновляем сообщение
+                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.edit_text(
+                    callback.message.text + "\n\n✅ **Опубликовано**",
+                    parse_mode=ParseMode.MARKDOWN
                 )
-            except:
-                pass  # Пользователь заблокировал бота
-            
-            # Обновляем сообщение у админа
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.edit_text(
-                callback.message.text + "\n\n✅ **Опубликовано**",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            await callback.answer("✅ Сообщение опубликовано!")
+                await callback.answer("✅ Опубликовано!")
+            else:
+                await callback.answer("❌ Ошибка при обновлении статуса", show_alert=True)
             
         except Exception as e:
-            await callback.answer(f"❌ Ошибка публикации: {e}", show_alert=True)
+            logger.error(f"Ошибка публикации: {e}")
+            await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
     
     elif action == 'rej':
-        # Отклонение сообщения
-        forward_id = int(data)
-        user_id = get_user_by_message(forward_id)
-        
-        if user_id:
+        # Отклонение
+        if update_message_status(forward_id, PostStatus.REJECTED):
+            log_admin_action(admin_id, 'reject', msg_info['user_id'])
+            
             try:
                 await bot.send_message(
-                    user_id,
-                    "❌ Ваше сообщение было отклонено модератором."
-                )
-            except:
-                pass
-        
-        # Удаляем сообщение у админа или помечаем
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.edit_text(
-            callback.message.text + "\n\n❌ **Отклонено**",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await callback.answer("❌ Сообщение отклонено")
-    
-    elif action == 'ban':
-        # Бан пользователя
-        forward_id = int(data)
-        user_id = get_user_by_message(forward_id)
-        
-        if user_id:
-            ban_user(user_id, "Нарушение правил")
-            try:
-                await bot.send_message(
-                    user_id,
-                    "⛔ Вы забанены за нарушение правил."
+                    msg_info['user_id'],
+                    "❌ Ваше сообщение отклонено"
                 )
             except:
                 pass
             
-            # Помечаем сообщение
             await callback.message.edit_reply_markup(reply_markup=None)
             await callback.message.edit_text(
-                callback.message.text + f"\n\n🚫 **Пользователь {user_id} забанен**",
+                callback.message.text + "\n\n❌ **Отклонено**",
                 parse_mode=ParseMode.MARKDOWN
             )
-            await callback.answer("🚫 Пользователь забанен")
+            await callback.answer("❌ Отклонено")
+        else:
+            await callback.answer("❌ Ошибка", show_alert=True)
     
-    elif action == 'reply':
-        # Ответ пользователю
-        user_id = int(data)
+    elif action == 'ban':
+        # Бан (запросить причину)
+        await state.set_state(AdminStates.waiting_for_ban_reason)
+        await state.update_data(ban_user_id=msg_info['user_id'], ban_forward_id=forward_id)
         
-        # Создаем временное состояние для ответа
         await callback.message.answer(
-            f"✍️ Введите ответ для пользователя {user_id} (анонимно):"
+            f"✍️ Введите причину бана для пользователя {msg_info['user_id']}:"
         )
-        
-        # Сохраняем в памяти, что этот админ сейчас отвечает этому пользователю
-        # В реальном проекте лучше использовать FSM, но для простоты так
-        reply_context[callback.from_user.id] = user_id
-        
         await callback.answer()
 
-# Хранилище контекста ответов (в реальном проекте заменить на FSM)
-reply_context = {}
-
-@dp.message(lambda message: message.from_user.id in ADMIN_IDS and message.text and not message.text.startswith('/'))
-async def handle_admin_reply(message: types.Message):
-    """Обработка ответа админа пользователю"""
-    admin_id = message.from_user.id
+@dp.message(AdminStates.waiting_for_ban_reason)
+async def process_ban_reason(message: types.Message, state: FSMContext):
+    """Обработка причины бана"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
     
-    if admin_id in reply_context:
-        user_id = reply_context[admin_id]
+    data = await state.get_data()
+    user_id = data.get('ban_user_id')
+    forward_id = data.get('ban_forward_id')
+    reason = message.text
+    
+    if user_id:
+        ban_user(user_id, message.from_user.id, reason)
+        log_admin_action(message.from_user.id, 'ban', user_id, reason)
         
         try:
-            # Отправляем ответ пользователю
-            await bot.send_message(
-                user_id,
-                f"📨 **Ответ администратора (анонимно):**\n\n{message.text}"
-            )
-            await message.answer(f"✅ Ответ отправлен пользователю {user_id}")
-        except Exception as e:
-            await message.answer(f"❌ Не удалось отправить ответ: {e}")
+            await bot.send_message(user_id, f"⛔ Вы забанены.\nПричина: {reason}")
+        except:
+            pass
         
-        # Очищаем контекст
-        del reply_context[admin_id]
+        if forward_id:
+            update_message_status(forward_id, PostStatus.REJECTED)
+            
+            # Обновляем сообщение у админов
+            try:
+                # Ищем все сообщения с этим forward_id у админов
+                for admin_id in ADMIN_IDS:
+                    # Не можем обновить, так как не знаем message_id
+                    # Но можно отправить уведомление
+                    await bot.send_message(
+                        admin_id,
+                        f"🚫 Пользователь {user_id} забанен. Причина: {reason}"
+                    )
+            except:
+                pass
+        
+        await message.answer(f"✅ Пользователь {user_id} забанен")
+    
+    await state.clear()
 
-# ================== ЗАПУСК БОТА ==================
+# ================== ЗАПУСК ==================
 async def main():
-    """Главная функция запуска бота"""
-    # Инициализация БД
+    """Запуск бота"""
     init_db()
     
-    logger.info("Бот запущен...")
+    # Проверяем наличие pandas
+    try:
+        import pandas as pd
+        import openpyxl
+    except ImportError as e:
+        logger.error(f"❌ Не установлены зависимости: {e}")
+        print("\n❌ Установите зависимости:")
+        print("pip install pandas openpyxl\n")
+        return
+    
+    # Проверяем подключение к Telegram
+    try:
+        me = await bot.get_me()
+        logger.info(f"✅ Бот @{me.username} подключен")
+        print(f"\n✅ Бот @{me.username} успешно запущен!")
+    except Exception as e:
+        logger.error(f"❌ Ошибка подключения к Telegram: {e}")
+        print(f"\n❌ Ошибка подключения: {e}")
+        return
+    
+    print("📝 Админские команды: /help_admin")
+    print("📝 Команды пользователей НЕ попадают в предложку")
+    print("="*50 + "\n")
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
