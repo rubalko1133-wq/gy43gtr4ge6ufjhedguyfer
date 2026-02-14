@@ -1,3 +1,56 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import subprocess
+import sys
+import importlib.util
+import os
+
+# ================== АВТОМАТИЧЕСКАЯ УСТАНОВКА ЗАВИСИМОСТЕЙ ==================
+def install_and_import(package, import_name=None):
+    """Проверяет наличие пакета и устанавливает его при необходимости"""
+    if import_name is None:
+        import_name = package
+    
+    try:
+        # Пробуем импортировать пакет
+        spec = importlib.util.find_spec(import_name)
+        if spec is None:
+            raise ImportError
+        print(f"✅ Пакет {package} уже установлен")
+        return True
+    except (ImportError, AttributeError):
+        print(f"📦 Устанавливаю пакет {package}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", package])
+            print(f"✅ Пакет {package} успешно установлен")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Ошибка при установке {package}: {e}")
+            return False
+
+# Список необходимых пакетов
+REQUIRED_PACKAGES = [
+    ("aiogram", "aiogram"),
+    ("pandas", "pandas"),
+    ("openpyxl", "openpyxl")
+]
+
+print("🔍 Проверка необходимых зависимостей...")
+all_installed = True
+for package, import_name in REQUIRED_PACKAGES:
+    if not install_and_import(package, import_name):
+        all_installed = False
+
+if not all_installed:
+    print("\n❌ Не удалось установить все зависимости.")
+    print("Попробуйте установить их вручную:")
+    print("pip install aiogram pandas openpyxl")
+    sys.exit(1)
+
+print("✅ Все зависимости успешно установлены!\n")
+
+# Теперь импортируем все необходимые модули
 import asyncio
 import logging
 import sqlite3
@@ -5,11 +58,10 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Union, Dict, Optional
 from enum import Enum
-import os
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
@@ -18,28 +70,35 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # Импортируем настройки из отдельного файла
-from config import (
-    BOT_TOKEN,
-    CHANNEL_ID,
-    ADMIN_IDS,
-    BOT_NAME,
-    DB_PATH,
-    DEBUG_MODE,
-    WELCOME_MESSAGE,
-    ADMIN_WELCOME
-)
+try:
+    from config import (
+        BOT_TOKEN,
+        CHANNEL_ID,
+        ADMIN_IDS,
+        BOT_NAME,
+        DB_PATH,
+        DEBUG_MODE,
+        WELCOME_MESSAGE,
+        ADMIN_WELCOME
+    )
+except ImportError:
+    print("=" * 50)
+    print("❌ ОШИБКА: Файл config.py не найден!")
+    print("Создайте файл config.py в той же папке")
+    print("=" * 50)
+    sys.exit(1)
 
 # ================== ПРОВЕРКА НАСТРОЕК ==================
 if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
     print("=" * 50)
-    print("ОШИБКА: Вы не указали токен бота в файле config.py!")
+    print("❌ ОШИБКА: Вы не указали токен бота в файле config.py!")
     print("Откройте config.py и вставьте свой токен от @BotFather")
     print("=" * 50)
-    exit(1)
+    sys.exit(1)
 
 if CHANNEL_ID == -1001234567890:
     print("=" * 50)
-    print("ВНИМАНИЕ: Вы не изменили ID канала в config.py!")
+    print("⚠️ ВНИМАНИЕ: Вы не изменили ID канала в config.py!")
     print("Бот будет работать, но посты будут уходить в тестовый канал")
     print("=" * 50)
 
@@ -59,7 +118,7 @@ try:
     logger.info(f"✅ Бот {BOT_NAME} инициализирован")
 except Exception as e:
     logger.error(f"❌ Ошибка инициализации бота: {e}")
-    exit(1)
+    sys.exit(1)
 
 # ================== СОСТОЯНИЯ ==================
 class AdminStates(StatesGroup):
@@ -902,29 +961,20 @@ async def main():
     """Запуск бота"""
     init_db()
     
-    # Проверяем наличие pandas
-    try:
-        import pandas as pd
-        import openpyxl
-    except ImportError as e:
-        logger.error(f"❌ Не установлены зависимости: {e}")
-        print("\n❌ Установите зависимости:")
-        print("pip install pandas openpyxl\n")
-        return
-    
     # Проверяем подключение к Telegram
     try:
         me = await bot.get_me()
         logger.info(f"✅ Бот @{me.username} подключен")
-        print(f"\n✅ Бот @{me.username} успешно запущен!")
+        print(f"\n{'='*50}")
+        print(f"✅ Бот @{me.username} успешно запущен!")
+        print(f"📊 База данных: {DB_PATH}")
+        print(f"👥 Администраторов: {len(ADMIN_IDS)}")
+        print(f"📢 Канал ID: {CHANNEL_ID}")
+        print(f"{'='*50}\n")
     except Exception as e:
         logger.error(f"❌ Ошибка подключения к Telegram: {e}")
         print(f"\n❌ Ошибка подключения: {e}")
         return
-    
-    print("📝 Админские команды: /help_admin")
-    print("📝 Команды пользователей НЕ попадают в предложку")
-    print("="*50 + "\n")
     
     await dp.start_polling(bot)
 
