@@ -17,29 +17,46 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Токен бота от @BotFather
-CHANNEL_ID = -1001234567890  # ID канала (отрицательное число с -100)
-ADMIN_IDS = [123456789, 987654321]  # ID админов (через запятую)
-# ================================================
+# Импортируем настройки из отдельного файла
+from config import (
+    BOT_TOKEN,
+    CHANNEL_ID,
+    ADMIN_IDS,
+    BOT_NAME,
+    DB_PATH,
+    DEBUG_MODE,
+    WELCOME_MESSAGE,
+    ADMIN_WELCOME
+)
 
-# Проверка токена
+# ================== ПРОВЕРКА НАСТРОЕК ==================
 if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
     print("=" * 50)
-    print("ОШИБКА: Вы не указали токен бота!")
+    print("ОШИБКА: Вы не указали токен бота в файле config.py!")
+    print("Откройте config.py и вставьте свой токен от @BotFather")
     print("=" * 50)
     exit(1)
 
-# Настройка логирования
+if CHANNEL_ID == -1001234567890:
+    print("=" * 50)
+    print("ВНИМАНИЕ: Вы не изменили ID канала в config.py!")
+    print("Бот будет работать, но посты будут уходить в тестовый канал")
+    print("=" * 50)
+
+# ================== НАСТРОЙКА ЛОГИРОВАНИЯ ==================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация бота и диспетчера
+if DEBUG_MODE:
+    logger.setLevel(logging.DEBUG)
+    logger.debug("🔧 Режим отладки включен")
+
+# ================== ИНИЦИАЛИЗАЦИЯ БОТА ==================
 storage = MemoryStorage()
 try:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=storage)
-    logger.info("✅ Бот инициализирован")
+    logger.info(f"✅ Бот {BOT_NAME} инициализирован")
 except Exception as e:
     logger.error(f"❌ Ошибка инициализации бота: {e}")
     exit(1)
@@ -58,72 +75,75 @@ class PostStatus(Enum):
 # ================== РАБОТА С БАЗОЙ ДАННЫХ ==================
 def init_db():
     """Создание таблиц в базе данных"""
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    
-    # Таблица для хранения ВСЕХ данных отправителей
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            message_text TEXT,
-            message_type TEXT,
-            file_id TEXT,
-            caption TEXT,
-            received_date TEXT,
-            forward_message_id INTEGER UNIQUE,
-            status TEXT DEFAULT 'new',
-            taken_by INTEGER DEFAULT NULL,
-            taken_date TEXT DEFAULT NULL,
-            published_date TEXT DEFAULT NULL,
-            channel_message_id INTEGER DEFAULT 0
-        )
-    ''')
-    
-    # Таблица забаненных пользователей
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS banned_users (
-            user_id INTEGER PRIMARY KEY,
-            ban_date TEXT,
-            reason TEXT,
-            banned_by INTEGER
-        )
-    ''')
-    
-    # Таблица для логов действий админов
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admin_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
-            action TEXT,
-            target_user_id INTEGER,
-            details TEXT,
-            action_date TEXT
-        )
-    ''')
-    
-    # Таблица настроек админов
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admin_settings (
-            admin_id INTEGER PRIMARY KEY,
-            receive_all_posts INTEGER DEFAULT 1,
-            notify_on_taken INTEGER DEFAULT 1
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    logger.info("✅ База данных инициализирована")
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Таблица для хранения ВСЕХ данных отправителей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                message_text TEXT,
+                message_type TEXT,
+                file_id TEXT,
+                caption TEXT,
+                received_date TEXT,
+                forward_message_id INTEGER UNIQUE,
+                status TEXT DEFAULT 'new',
+                taken_by INTEGER DEFAULT NULL,
+                taken_date TEXT DEFAULT NULL,
+                published_date TEXT DEFAULT NULL,
+                channel_message_id INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Таблица забаненных пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                ban_date TEXT,
+                reason TEXT,
+                banned_by INTEGER
+            )
+        ''')
+        
+        # Таблица для логов действий админов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                action TEXT,
+                target_user_id INTEGER,
+                details TEXT,
+                action_date TEXT
+            )
+        ''')
+        
+        # Таблица настроек админов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admin_settings (
+                admin_id INTEGER PRIMARY KEY,
+                receive_all_posts INTEGER DEFAULT 1,
+                notify_on_taken INTEGER DEFAULT 1
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ База данных {DB_PATH} инициализирована")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при инициализации БД: {e}")
 
 def save_user_message(user_id: int, username: str, first_name: str, last_name: str, 
                       message_text: str, message_type: str, file_id: str, caption: str, 
                       forward_msg_id: int):
     """Сохранение данных отправителя в базу"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO user_messages 
@@ -136,7 +156,7 @@ def save_user_message(user_id: int, username: str, first_name: str, last_name: s
         ))
         conn.commit()
         conn.close()
-        logger.info(f"✅ Сообщение от {user_id} сохранено в БД")
+        logger.debug(f"✅ Сообщение от {user_id} сохранено в БД")
         return True
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения сообщения: {e}")
@@ -145,7 +165,7 @@ def save_user_message(user_id: int, username: str, first_name: str, last_name: s
 def update_message_status(forward_msg_id: int, status: PostStatus, taken_by: int = None, channel_msg_id: int = None):
     """Обновление статуса сообщения"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         if status == PostStatus.TAKEN and taken_by:
@@ -171,6 +191,7 @@ def update_message_status(forward_msg_id: int, status: PostStatus, taken_by: int
         
         conn.commit()
         conn.close()
+        logger.debug(f"✅ Статус сообщения {forward_msg_id} обновлен на {status.value}")
         return True
     except Exception as e:
         logger.error(f"Ошибка обновления статуса: {e}")
@@ -179,7 +200,7 @@ def update_message_status(forward_msg_id: int, status: PostStatus, taken_by: int
 def get_message_info(forward_msg_id: int) -> dict:
     """Получение информации о сообщении"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
             SELECT user_id, username, first_name, last_name, message_text, 
@@ -209,7 +230,7 @@ def get_message_info(forward_msg_id: int) -> dict:
 def export_to_excel(admin_id: int, days: int = None) -> BytesIO:
     """Экспорт данных в Excel"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         
         # Формируем запрос
         query = '''
@@ -268,7 +289,7 @@ def export_to_excel(admin_id: int, days: int = None) -> BytesIO:
 def get_user_stats(user_id: int = None) -> dict:
     """Получение статистики"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         if user_id:
@@ -317,7 +338,7 @@ def get_user_stats(user_id: int = None) -> dict:
 def is_user_banned(user_id: int) -> bool:
     """Проверка бана"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('SELECT reason FROM banned_users WHERE user_id = ?', (user_id,))
         result = cursor.fetchone()
@@ -329,7 +350,7 @@ def is_user_banned(user_id: int) -> bool:
 def ban_user(user_id: int, admin_id: int, reason: str):
     """Бан пользователя"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO banned_users (user_id, ban_date, reason, banned_by) 
@@ -344,7 +365,7 @@ def ban_user(user_id: int, admin_id: int, reason: str):
 def unban_user(user_id: int):
     """Разбан пользователя"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
         conn.commit()
@@ -356,7 +377,7 @@ def unban_user(user_id: int):
 def log_admin_action(admin_id: int, action: str, target_user_id: int = None, details: str = ""):
     """Логирование действий админа"""
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO admin_logs (admin_id, action, target_user_id, details, action_date) 
@@ -395,9 +416,6 @@ def get_moderation_keyboard(forward_id: int, taken_by: int = None) -> InlineKeyb
     return builder.as_markup()
 
 # ================== КОМАНДЫ АДМИНОВ ==================
-# ВАЖНО: Все команды обрабатываются ДО основного обработчика сообщений
-# и НЕ попадают в предложку
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     """Старт для всех пользователей"""
@@ -409,35 +427,10 @@ async def cmd_start(message: types.Message):
     
     # Если это админ - показываем админ-меню
     if user_id in ADMIN_IDS:
-        await show_admin_menu(message)
+        await message.answer(ADMIN_WELCOME, parse_mode=ParseMode.MARKDOWN)
         return
     
-    welcome_text = """
-👋 Привет! Я бот для анонимных сообщений в канал.
-
-📝 Просто отправь мне текст, фото или видео
-🔒 Твои данные видны только администрации
-⚠️ Не отправляй оскорбления и спам
-    """
-    await message.answer(welcome_text)
-
-async def show_admin_menu(message: types.Message):
-    """Показ меню администратора"""
-    text = """
-🔐 **ПАНЕЛЬ АДМИНИСТРАТОРА**
-
-📊 **Команды:**
-/export - выгрузить все сообщения в Excel
-/export_days [N] - выгрузить сообщения за N дней
-/stats - общая статистика
-/user_stats [user_id] - статистика пользователя
-/ban [user_id] [причина] - забанить пользователя
-/unban [user_id] - разбанить пользователя
-/help_admin - помощь по командам
-
-📝 **Важно:** Команды видны только вам
-    """
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(WELCOME_MESSAGE)
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message):
@@ -625,14 +618,14 @@ def is_command(message: types.Message) -> bool:
     return message.text and message.text.startswith('/')
 
 # ================== ОБРАБОТЧИК СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ==================
-@dp.message(lambda message: not is_command(message))  # ВАЖНО: Игнорируем команды!
+@dp.message(lambda message: not is_command(message))
 async def handle_user_message(message: types.Message):
     """Обработка входящих сообщений (НЕ КОМАНД)"""
     user_id = message.from_user.id
     
-    # Дополнительная проверка на команды (на всякий случай)
+    # Дополнительная проверка на команды
     if message.text and message.text.startswith('/'):
-        logger.info(f"Игнорируем команду от {user_id}: {message.text}")
+        logger.debug(f"Игнорируем команду от {user_id}: {message.text}")
         return
     
     # Проверка бана
@@ -677,7 +670,7 @@ async def handle_user_message(message: types.Message):
         message_text, message_type, file_id, caption,
         message.message_id
     ):
-        # Отправляем админам (без данных отправителя в тексте!)
+        # Отправляем админам (только ID!)
         admin_text = f"📨 **Новое сообщение**\n"
         admin_text += f"🆔 ID: `{user_id}`\n"
         admin_text += f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
@@ -740,7 +733,6 @@ async def handle_user_message(message: types.Message):
                         reply_markup=get_moderation_keyboard(message.message_id)
                     )
                 else:
-                    # Если тип не поддерживается
                     await bot.send_message(
                         admin_id,
                         admin_text + f"📝 [Неподдерживаемый тип сообщения]",
@@ -891,12 +883,9 @@ async def process_ban_reason(message: types.Message, state: FSMContext):
         if forward_id:
             update_message_status(forward_id, PostStatus.REJECTED)
             
-            # Обновляем сообщение у админов
+            # Уведомляем админов
             try:
-                # Ищем все сообщения с этим forward_id у админов
                 for admin_id in ADMIN_IDS:
-                    # Не можем обновить, так как не знаем message_id
-                    # Но можно отправить уведомление
                     await bot.send_message(
                         admin_id,
                         f"🚫 Пользователь {user_id} забанен. Причина: {reason}"
@@ -904,40 +893,4 @@ async def process_ban_reason(message: types.Message, state: FSMContext):
             except:
                 pass
         
-        await message.answer(f"✅ Пользователь {user_id} забанен")
-    
-    await state.clear()
-
-# ================== ЗАПУСК ==================
-async def main():
-    """Запуск бота"""
-    init_db()
-    
-    # Проверяем наличие pandas
-    try:
-        import pandas as pd
-        import openpyxl
-    except ImportError as e:
-        logger.error(f"❌ Не установлены зависимости: {e}")
-        print("\n❌ Установите зависимости:")
-        print("pip install pandas openpyxl\n")
-        return
-    
-    # Проверяем подключение к Telegram
-    try:
-        me = await bot.get_me()
-        logger.info(f"✅ Бот @{me.username} подключен")
-        print(f"\n✅ Бот @{me.username} успешно запущен!")
-    except Exception as e:
-        logger.error(f"❌ Ошибка подключения к Telegram: {e}")
-        print(f"\n❌ Ошибка подключения: {e}")
-        return
-    
-    print("📝 Админские команды: /help_admin")
-    print("📝 Команды пользователей НЕ попадают в предложку")
-    print("="*50 + "\n")
-    
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        await message.answer(f"✅ Пользователь
