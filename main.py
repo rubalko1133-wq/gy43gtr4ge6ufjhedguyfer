@@ -1,10 +1,12 @@
 import logging
 import sqlite3
 import random
+import warnings
 from datetime import datetime
 from functools import wraps
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,11 +17,22 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# Подавляем конкретное предупреждение PTBUserWarning для CallbackQueryHandler в ConversationHandler
+warnings.filterwarnings(
+    action="ignore",
+    message=r".*CallbackQueryHandler",
+    category=PTBUserWarning
+)
+
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+
+# Также можно уменьшить количество логов от httpx, если они мешают
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # Конфигурация
@@ -658,6 +671,7 @@ def main():
     print("✅ Бот-пересыльщик запущен!")
     print(f"📨 Сообщения из ЛС будут отправляться в группу с ID: {GROUP_CHAT_ID}")
     print(f"👑 Администраторы: {ADMIN_IDS}")
+    print("⚙️ Предупреждения PTBUserWarning подавлены.")
     
     application.run_polling()
 
