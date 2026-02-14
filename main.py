@@ -24,8 +24,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-TOKEN = "8426732266:AAGAokm2pmq-FC9m0Laj3rlgFN328IsaFCw"  # Замените на токен вашего бота
-ADMIN_IDS = [8287134813,1431520267]  # ID администраторов бота
+TOKEN = "8426732266:AAGAokm2pmq-FC9m0Laj3rlgFN328IsaFCw"
+ADMIN_IDS = [8287134813, 1431520267]  # ID администраторов бота
+GROUP_CHAT_ID = -1001234567890  # ID вашей группы (со знаком минус) - нужно заменить!
 
 # Состояния для ConversationHandler
 REGISTER_NICKNAME = 1
@@ -105,10 +106,10 @@ def registered_only(func):
                 "❌ Вы не зарегистрированы.\n"
                 "Используйте /register для регистрации."
             )
-            return
+            return False
         elif result[1] == 1:
             await update.message.reply_text("❌ Вы забанены и не можете писать в чат.")
-            return
+            return False
         
         return await func(update, context, *args, **kwargs)
     return wrapper
@@ -122,10 +123,10 @@ def is_nickname_unique(nickname):
     conn.close()
     return result is None
 
-# Генерация случайного ника (на случай, если пользователь не хочет придумывать)
+# Генерация случайного ника
 def generate_random_nickname():
-    adjectives = ['Смелый', 'Храбрый', 'Веселый', 'Умный', 'Быстрый', 'Тихий', 'Яркий', 'Темный']
-    nouns = ['Кот', 'Пес', 'Лис', 'Волк', 'Медведь', 'Тигр', 'Дракон', 'Феникс']
+    adjectives = ['Смелый', 'Храбрый', 'Веселый', 'Умный', 'Быстрый', 'Тихий', 'Яркий', 'Темный', 'Мудрый', 'Добрый']
+    nouns = ['Кот', 'Пес', 'Лис', 'Волк', 'Медведь', 'Тигр', 'Дракон', 'Феникс', 'Орел', 'Лев']
     number = random.randint(1, 999)
     return f"{random.choice(adjectives)}{random.choice(nouns)}{number}"
 
@@ -147,10 +148,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect('anon_group.db')
     c = conn.cursor()
     c.execute("SELECT is_registered FROM users WHERE user_id=?", (user.id,))
-    is_registered = c.fetchone()[0]
+    result = c.fetchone()
     conn.close()
     
-    if is_registered:
+    if result and result[0] == 1:
         await update.message.reply_text(
             "👋 С возвращением в анонимный чат!\n"
             "Используйте /help для списка команд."
@@ -228,7 +229,7 @@ async def register_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "✏️ Введите желаемый никнейм:\n\n"
             "Требования:\n"
-            "• Только буквы и цифры\n"
+            "• Только буквы, цифры и _\n"
             "• Длина от 3 до 20 символов\n"
             "• Ник должен быть уникальным"
         )
@@ -338,12 +339,12 @@ async def change_nick_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not result or result[0] == 0:
         await update.message.reply_text("❌ Сначала зарегистрируйтесь через /register")
-        return
+        return ConversationHandler.END
     
     await update.message.reply_text(
         "✏️ Введите новый никнейм:\n\n"
         "Требования:\n"
-        "• Только буквы и цифры\n"
+        "• Только буквы, цифры и _\n"
         "• Длина от 3 до 20 символов\n"
         "• Ник должен быть уникальным"
     )
@@ -550,13 +551,22 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = c.fetchall()
     conn.close()
     
+    if not users:
+        await update.message.reply_text("📭 Нет зарегистрированных пользователей.")
+        return
+    
     text = "📋 Все пользователи:\n\n"
     for user in users:
         nickname, user_id, msgs, banned = user
         status = "🚫" if banned else "✅"
         text += f"{status} {nickname} (ID: {user_id}) - {msgs} сообщ.\n"
     
-    await update.message.reply_text(text[:4096])
+    # Разбиваем на части, если текст слишком длинный
+    if len(text) > 4096:
+        for i in range(0, len(text), 4096):
+            await update.message.reply_text(text[i:i+4096])
+    else:
+        await update.message.reply_text(text)
 
 # Команда статистики
 @admin_only
@@ -576,9 +586,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("SELECT COUNT(*) FROM messages")
     total_messages = c.fetchone()[0]
     
-    c.execute("SELECT SUM(messages_count) FROM users")
-    total_messages_from_users = c.fetchone()[0] or 0
-    
     c.execute("SELECT COUNT(*) FROM messages WHERE date(timestamp) = date('now')")
     today_messages = c.fetchone()[0]
     
@@ -595,15 +602,32 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stats_text)
 
 # Обработка сообщений (только для зарегистрированных)
-@registered_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Проверяем, что сообщение из группы
+    if update.effective_chat.type not in ['group', 'supergroup']:
+        return
+    
     user = update.effective_user
     
-    # Получаем ник пользователя
+    # Проверяем регистрацию
     conn = sqlite3.connect('anon_group.db')
     c = conn.cursor()
-    c.execute("SELECT nickname FROM users WHERE user_id=?", (user.id,))
-    nickname = c.fetchone()[0]
+    c.execute("SELECT is_registered, is_banned, nickname FROM users WHERE user_id=?", (user.id,))
+    result = c.fetchone()
+    
+    if not result or result[0] == 0:
+        conn.close()
+        await update.message.reply_text(
+            "❌ Вы не зарегистрированы.\n"
+            "Используйте /register для регистрации."
+        )
+        return
+    elif result[1] == 1:
+        conn.close()
+        await update.message.reply_text("❌ Вы забанены и не можете писать в чат.")
+        return
+    
+    is_registered, is_banned, nickname = result
     
     # Обновляем счетчик сообщений
     c.execute("UPDATE users SET messages_count = messages_count + 1 WHERE user_id=?", (user.id,))
@@ -616,16 +640,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
-    # Удаляем оригинальное сообщение
+    # Удаляем оригинальное сообщение пользователя
     await update.message.delete()
     
     # Создаем клавиатуру с кнопкой жалобы
     keyboard = [[InlineKeyboardButton("⚠️ Пожаловаться", callback_data=f"complain_{message_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Отправляем анонимное сообщение с ником
-    sent_message = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
+    # Отправляем анонимное сообщение в группу
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,  # Отправляем в тот же чат
         text=f"👤 *{nickname}*:\n\n{update.message.text}",
         reply_markup=reply_markup,
         parse_mode='Markdown'
@@ -651,7 +675,16 @@ async def complain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Получаем ник жалобщика
             c.execute("SELECT nickname FROM users WHERE user_id=?", (complainer_id,))
-            complainer_nick = c.fetchone()[0]
+            result = c.fetchone()
+            if not result:
+                await query.edit_message_text(
+                    text=query.message.text + "\n\n❌ Вы не зарегистрированы.",
+                    reply_markup=None
+                )
+                conn.close()
+                return
+            
+            complainer_nick = result[0]
             
             # Сохраняем жалобу
             c.execute("""INSERT INTO complaints 
@@ -665,6 +698,19 @@ async def complain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=query.message.text + "\n\n✅ Жалоба отправлена администратору.",
                 reply_markup=None
             )
+            
+            # Уведомляем админов о новой жалобе
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        admin_id,
+                        f"⚠️ Новая жалоба!\n"
+                        f"От: {complainer_nick}\n"
+                        f"На: {reported_nick}\n"
+                        f"Сообщение: {message_text[:100]}..."
+                    )
+                except:
+                    pass
         else:
             await query.edit_message_text(
                 text=query.message.text + "\n\n❌ Сообщение не найдено.",
@@ -684,10 +730,8 @@ async def complain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Можно жаловаться только на анонимные сообщения.")
         return
     
-    # Здесь можно добавить логику для текстовой жалобы
     await update.message.reply_text(
-        "✅ Жалоба отправлена.\n"
-        "Используйте кнопку 'Пожаловаться' под сообщением для более быстрой отправки."
+        "✅ Используйте кнопку 'Пожаловаться' под сообщением для отправки жалобы."
     )
 
 # Основная функция
@@ -735,11 +779,14 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
     application.add_handler(CallbackQueryHandler(complain_callback, pattern="^complain_"))
     
-    # Обработчик сообщений
+    # Обработчик сообщений (только текст, не команды)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Запускаем бота
     print("Бот запущен...")
+    print(f"Токен: {TOKEN}")
+    print(f"Администраторы: {ADMIN_IDS}")
+    print("⚠️ НЕ ЗАБУДЬТЕ ЗАМЕНИТЬ GROUP_CHAT_ID на ID вашей группы!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
