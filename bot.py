@@ -893,4 +893,40 @@ async def process_ban_reason(message: types.Message, state: FSMContext):
             except:
                 pass
         
-        await message.answer(f"✅ Пользователь
+        await message.answer(f"✅ Пользователь {user_id} забанен")
+    
+    await state.clear()
+
+# ================== ЗАПУСК ==================
+async def main():
+    """Запуск бота"""
+    init_db()
+    
+    # Проверяем наличие pandas
+    try:
+        import pandas as pd
+        import openpyxl
+    except ImportError as e:
+        logger.error(f"❌ Не установлены зависимости: {e}")
+        print("\n❌ Установите зависимости:")
+        print("pip install pandas openpyxl\n")
+        return
+    
+    # Проверяем подключение к Telegram
+    try:
+        me = await bot.get_me()
+        logger.info(f"✅ Бот @{me.username} подключен")
+        print(f"\n✅ Бот @{me.username} успешно запущен!")
+    except Exception as e:
+        logger.error(f"❌ Ошибка подключения к Telegram: {e}")
+        print(f"\n❌ Ошибка подключения: {e}")
+        return
+    
+    print("📝 Админские команды: /help_admin")
+    print("📝 Команды пользователей НЕ попадают в предложку")
+    print("="*50 + "\n")
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
